@@ -18,11 +18,24 @@ struct State: CustomStringConvertible {
     /** 한/A 전환이 Caps Lock인 경우 Caps Lock이 활성화/비활성화 되는 과정에서 한/A 전환이 진행될 수 있는지 여부를 판단하는 플래그 (InputMonitor와 유사) */
     private var canCapsLockRotate = true
 
+    /** InputMonitor가 이미 한/A 전환을 반영한 경우 handle()의 중복 rotate를 건너뛴다 */
+    private var skipNextRotate = false
+
     /** 마지막으로 keyDown이었던 Caps Lock Input */
     private var lastCapsLockDownInput: Input?
 
     /** 현재 눌려있는 Input, 반복 입력 시 사용 */
     private(set) var down: Input?
+
+    /** 모니터가 중단되거나 입력기가 비활성화되면 놓친 keyUp 상태를 버린다. */
+    mutating func resetInputState() {
+        modifier.removeAll()
+        down = nil
+        skipNextRotate = false
+        lastCapsLockDownInput = nil
+        canCapsLockRotate = true
+        isCapsLockOn = false
+    }
 
     /** 새로운 Input 입력 처리 */
     mutating func next(_ input: Input) {
@@ -34,58 +47,24 @@ struct State: CustomStringConvertible {
         if let key = ModifierUsage(rawValue: usage) {
             modifier[key] = type
 
-            // 오른쪽 Command: 한/A 전환 *실제 처리*
-            if (type, key) == (.keyDown, .rightCommand)
-                && Preferences.rotateShortcuts.contains(.rightCommand) {
-                rotate()
-            }
-
-            // 오른쪽 Option: 한/A 전환 *실제 처리*
-            if (type, key) == (.keyDown, .rightOption)
-                && Preferences.rotateShortcuts.contains(.rightOption) {
-                rotate()
-            }
-
-            // Caps Lock: 한/A 상태 및 LED *실제 처리*
+            // 한/A 전환은 단축키 경로(탭/HID)에서만 한다.
+            // 여기서 다시 rotate하면 다음 글자의 handle()이 Caps Lock keyDown을
+            // 한 번 더 보고 한글에서 영문으로 되돌린다.
             if (type, key) == (.keyDown, .capsLock) {
-                // 한/A 전환이 Caps Lock인 경우 처리
                 if Preferences.rotateShortcuts.contains(.capsLock) {
-                    // Caps Lock 활성 -> 비활성: 한/A 전환 1회 억제
-                    if isCapsLockOn {
-                        canCapsLockRotate = false
-                    }
-
-                    // Caps Lock 비활성화
                     isCapsLockOn = false
                     lastCapsLockDownInput = input
-
-                    // 한/A 전환
-                    if canCapsLockRotate {
-                        rotate()
-                    } else {
-                        canCapsLockRotate = true
-                    }
-                }
-                // 그 외의 경우 일반 반전 처리
-                else {
+                    skipNextRotate = false
+                } else {
                     isCapsLockOn.toggle()
                 }
             }
 
-            // Caps Lock: Caps Lock *실제 처리*
+            // Caps Lock keyUp: 800ms 홀드는 InputMonitor 타이머가 StatusBar와 함께 처리한다.
+            // HID timestamp로 여기서 engine만 A로 바꾸면 트레이와 입력이 어긋난다.
             if (type, key) == (.keyUp, .capsLock)
                 && Preferences.rotateShortcuts.contains(.capsLock) {
-                // 마지막으로 keyDown된 Caps Lock Input의 timestamp가 800ms 이상 차이 나면 Caps Lock 활성화
-                if let down = lastCapsLockDownInput,
-                    ms(absolute: input.timestamp) - ms(absolute: down.timestamp) > 800 {
-                    // Caps Lock 비활성 -> 활성: 한/A 전환 1회 억제
-                    canCapsLockRotate = false
-
-                    // Caps Lock 활성화
-                    isCapsLockOn = true
-                    lastCapsLockDownInput = nil
-                    engine = engines.A
-                }
+                lastCapsLockDownInput = nil
             }
         }
         // 그 외 경우 중 keyDown인 경우
@@ -94,9 +73,15 @@ struct State: CustomStringConvertible {
             down = input
 
             // Command, Shift, Option, Control
-            let isCommandDown = modifier[.leftCommand] == .keyDown || modifier[.rightCommand] == .keyDown
+            // 한/A 키로 쓰는 오른쪽 Command·Option은 조합 키로 보지 않는다.
+            // 빠르게 치면 한/A 키를 떼기 전에 다음 글자가 눌리는데, 이걸 단축키로 보면 글자가 씹힌다.
+            let rightCommandIsRotate = Preferences.rotateShortcuts.contains(.rightCommand)
+            let rightOptionIsRotate = Preferences.rotateShortcuts.contains(.rightOption)
+            let isCommandDown = modifier[.leftCommand] == .keyDown
+                || (modifier[.rightCommand] == .keyDown && !rightCommandIsRotate)
             let isShiftDown = modifier[.leftShift] == .keyDown || modifier[.rightShift] == .keyDown
-            let isOptionDown = modifier[.leftOption] == .keyDown || modifier[.rightOption] == .keyDown
+            let isOptionDown = modifier[.leftOption] == .keyDown
+                || (modifier[.rightOption] == .keyDown && !rightOptionIsRotate)
             let isControlDown = modifier[.leftControl] == .keyDown || modifier[.rightControl] == .keyDown
 
             // Command/Shift/Control + Space: keyDown인 경우 한/A 전환 // TODO: #15
@@ -113,8 +98,11 @@ struct State: CustomStringConvertible {
                 && usage == SpecialUsage.space.rawValue
                 && Preferences.rotateShortcuts.contains(.controlSpace)
             ) {
-                rotate()
-
+                if skipNextRotate {
+                    skipNextRotate = false
+                } else {
+                    rotate()
+                }
                 return
             }
 
@@ -157,24 +145,47 @@ struct State: CustomStringConvertible {
 
     let engines = (한: TwoSetEngine.self, A: QwertyEngine.self) // TODO: #24
 
-    private var _engine: Engine.Type = TwoSetEngine.self
     var engine: Engine.Type {
-        get { _engine }
+        get { appDelegate()?.inputEngine ?? TwoSetEngine.self }
         set {
-            _engine = newValue
-            appDelegate()?.statusBar.setEngine(engine)
+            if appDelegate()?.inputEngine.name != newValue.name {
+                appDelegate()?.inputEngine = newValue
+            }
         }
     }
 
     init(engine: Engine.Type) {
         debug("\(engine)")
-
         self.engine = engine
+    }
+
+    /** HID 단축키에서 즉시 전환하고, 이어지는 handle()의 rotate()는 건너뛴다 */
+    mutating func rotateFromShortcut() {
+        debug()
+
+        engine = engine == engines.한 ? engines.A : engines.한
+        skipNextRotate = true
+        appDelegate()?.statusBar.setEngine(engine)
+    }
+
+    /** handle()로 들어온 전환키(F18 등)로 즉시 전환, 이전 단축키의 건너뛰기 표시는 버린다 */
+    mutating func rotateFromKeyCode() {
+        debug()
+
+        skipNextRotate = false
+        engine = engine == engines.한 ? engines.A : engines.한
     }
 
     /** 사용 가능한 다음 engine으로 변경 */
     mutating func rotate() {
         debug()
+
+        if skipNextRotate {
+            skipNextRotate = false
+            debug("단축키 전환이 이미 반영됨")
+            appDelegate()?.statusBar.setEngine(engine)
+            return
+        }
 
         engine = engine == engines.한 ? engines.A : engines.한
     }

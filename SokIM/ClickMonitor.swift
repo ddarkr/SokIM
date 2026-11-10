@@ -50,7 +50,15 @@ class ClickMonitor {
             callback: { _, type, event, _ in
                 debug("\(type) \(event.flags)")
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    // 탭이 꺼진 동안 놓친 클릭이 마지막 키 입력보다 나중이면 그때 조합을 끝낸다
+                    let src = CGEventSourceStateID.combinedSessionState
+                    let sinceClick = [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown]
+                        .map { CGEventSource.secondsSinceLastEventType(src, eventType: $0) }
+                        .min() ?? .infinity
+                    let sinceKey = CGEventSource.secondsSinceLastEventType(src, eventType: .keyDown)
+                    if sinceClick < sinceKey { appDelegate()?.commit() }
                     appDelegate()?.restartMonitors(nil)
+                    return Unmanaged.passUnretained(event)
                 }
 
                 // 사용자가 마우스 클릭하는 시점에 조합 종료

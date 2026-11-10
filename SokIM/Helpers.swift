@@ -2,13 +2,16 @@ import os
 import Darwin
 import IOKit.hid
 import Foundation
+import Carbon.HIToolbox
 
 // MARK: - Logger
 
-func debug(_ message: String = "",
+/** 디버그 모드가 꺼져 있으면 메시지 문자열을 만들지 않는다. 키 입력마다 불리므로 autoclosure로 받는다. */
+func debug(_ message: @autoclosure () -> String = "",
            fileID: String = #fileID,
            function: String = #function) {
     if Preferences.debug {
+        let message = message()
         Logger().debug("\(fileID, privacy: .public): \(function, privacy: .public) \(message, privacy: .public)")
     }
 }
@@ -63,6 +66,29 @@ func ms(absolute: UInt64) -> UInt64 {
     let nsec = UInt64(absolute) * UInt64(sTimebaseInfo.numer) / UInt64(sTimebaseInfo.denom)
 
     return nsec / UInt64(NSEC_PER_MSEC)
+}
+
+// MARK: - Secure Input
+
+/** 현재 사용자 세션에서 보안 입력을 활성화한 프로세스의 PID */
+func getSecureInputPID() -> pid_t? {
+    debug()
+
+    let root = IORegistryGetRootEntry(kIOMainPortDefault)
+    defer { IOObjectRelease(root) }
+
+    guard let users = IORegistryEntryCreateCFProperty(
+        root,
+        "IOConsoleUsers" as CFString,
+        kCFAllocatorDefault,
+        .zero
+    )?.takeRetainedValue() as? [[String: Any]] else {
+        warning("IOConsoleUsers 없음")
+        return nil
+    }
+
+    return users
+        .first { ($0["kCGSSessionUserIDKey"] as? uid_t) == getuid() }?["kCGSSessionSecureInputPID"] as? pid_t
 }
 
 // MARK: - Modifier Mapping
@@ -146,13 +172,56 @@ func getMappedModifierUsage(_ usage: UInt32, _ device: IOHIDDevice) -> UInt32 {
     return usage
 }
 
+// MARK: - 현재 입력 소스
+
+func currentInputSourceIDs() -> [String] {
+    guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
+        notice("TIS current 없음")
+        return []
+    }
+
+    var ids: [String] = []
+    if let opaque = TISGetInputSourceProperty(current, kTISPropertyInputSourceID) {
+        ids.append(Unmanaged<CFString>.fromOpaque(opaque).takeUnretainedValue() as String)
+    }
+    if let opaque = TISGetInputSourceProperty(current, kTISPropertyInputModeID) {
+        ids.append(Unmanaged<CFString>.fromOpaque(opaque).takeUnretainedValue() as String)
+    }
+    if let opaque = TISGetInputSourceProperty(current, kTISPropertyBundleID) {
+        ids.append(Unmanaged<CFString>.fromOpaque(opaque).takeUnretainedValue() as String)
+    }
+    return ids
+}
+
+func isAppleKoreanInputSource() -> Bool {
+    currentInputSourceIDs().contains { $0.contains("com.apple.inputmethod.Korean") }
+}
+
+func isSokIMCurrentInputSource() -> Bool {
+    let ids = currentInputSourceIDs()
+    debug("current input: \(ids.joined(separator: ", "))")
+    return ids.contains { $0 == "com.kiding.inputmethod.sok" || $0.hasPrefix("com.kiding.inputmethod.sok.") }
+}
+
+func containsHangul(_ text: String?) -> Bool {
+    guard let text else { return false }
+    return text.unicodeScalars.contains { scalar in
+        (0x1100...0x11FF).contains(scalar.value)
+            || (0x3130...0x318F).contains(scalar.value)
+            || (0xAC00...0xD7AF).contains(scalar.value)
+    }
+}
+
 // MARK: - 물리 키보드 Caps Lock 상태
 
 private var state: Bool = false
 private var block1 = DispatchWorkItem { }
 private var block2 = DispatchWorkItem { }
+private let hidQueue = DispatchQueue(label: "com.kiding.inputmethod.sok.capsLockHID")
+private var hidManager: IOHIDManager?
+private var hidFailureCount = 0
 
-private let initHID = {
+private func makeHIDManager() -> IOHIDManager? {
     let hid = IOHIDManagerCreate(kCFAllocatorDefault, 0)
     IOHIDManagerSetDeviceMatching(hid, [
         kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, // Generic Desktop Page (0x01)
@@ -161,84 +230,102 @@ private let initHID = {
 
     if IOHIDManagerOpen(hid, 0) != kIOReturnSuccess {
         warning("IOHIDManagerOpen 실패")
-        return nil as IOHIDManager?
+        return nil
     }
 
     return hid
 }
-private var hid = initHID()
 
 func setKeyboardCapsLock(enabled: Bool) {
     debug("enabled: \(enabled) (state: \(state))")
 
+    state = enabled
+
     /** HIS_XPC: Caps Lock 상태는 늘 false */
     block1.cancel()
     block1 = DispatchWorkItem {
+        guard isSokIMCurrentInputSource(),
+              !(appDelegate()?.isSecureInputEnabledInFrontmostApp() ?? true) else { return }
         debug("HIS_XPC_SetCapsLockModifierState")
         HIS_XPC_SetCapsLockModifierState(false)
     }
 
     /** HIS_XPC: Sonoma 이후 커서 밑에 생기는 "버블"/HUD/Indicator/Accessory 방지 */
-    for delay in stride(from: 0, to: 200, by: 20) {
+    for delay in [0, 50, 100] {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay), execute: block1)
     }
 
     block2.cancel()
     block2 = DispatchWorkItem {
-        /** HID: 키보드 찾기 */
-        if hid == nil { hid = initHID() }
-        guard let hid,
-              let devs = IOHIDManagerCopyDevices(hid) as? Set<IOHIDDevice> else {
-            warning("IOHIDManagerCopyDevices 실패")
-            return
+        guard isSokIMCurrentInputSource(),
+              !(appDelegate()?.isSecureInputEnabledInFrontmostApp() ?? true) else { return }
+        hidQueue.async { applyKeyboardCapsLockHID(enabled: enabled) }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(30), execute: block2)
+}
+
+private func applyKeyboardCapsLockHID(enabled: Bool) {
+    if hidManager == nil { hidManager = makeHIDManager() }
+    guard let manager = hidManager,
+          let devs = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
+        warning("IOHIDManagerCopyDevices 실패")
+        hidManager = nil
+        return
+    }
+
+    var wroteLED = false
+    for dev in devs {
+        /** HID: Caps Lock 상태는 늘 false */
+        let serv = IOHIDDeviceGetService(dev)
+        var conn: io_connect_t = 0
+
+        guard IOServiceOpen(serv, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS else {
+            warning("IOServiceOpen 실패: \(serv)")
+            continue
+        }
+        defer { IOServiceClose(conn) }
+
+        guard IOHIDSetModifierLockState(conn, Int32(kIOHIDCapsLockState), false) == KERN_SUCCESS else {
+            warning("IOHIDSetModifierLockState 실패: \(conn)")
+            continue
         }
 
-        for dev in devs {
-            /** HID: Caps Lock 상태는 늘 false */
-            let serv = IOHIDDeviceGetService(dev)
-            var conn: io_connect_t = 0
+        debug("IOHIDSetModifierLockState 성공: \(dev)")
 
-            guard IOServiceOpen(serv, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS else {
-                warning("IOServiceOpen 실패: \(serv)")
-                continue
+        /** HID: Caps Lock LED. 일부 내장 키보드 요소는 쓰기가 거절되며 한/A 전환과 무관하다. */
+        guard let elems = IOHIDDeviceCopyMatchingElements(dev, [
+            kIOHIDElementUsagePageKey: kHIDPage_LEDs,     // LED Page (0x08)
+            kIOHIDElementUsageKey: kHIDUsage_LED_CapsLock // Caps Lock (0x02)
+        ] as CFDictionary, 0) as? [IOHIDElement] else {
+            debug("IOHIDDeviceCopyMatchingElements 실패: \(dev)")
+            continue
+        }
+
+        let time = mach_absolute_time()
+        for elem in elems {
+            let val = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, elem, time, enabled ? 1 : 0)
+            if IOHIDDeviceSetValue(dev, elem, val) == kIOReturnSuccess {
+                wroteLED = true
+            } else {
+                debug("IOHIDDeviceSetValue 실패: \(elem)")
             }
-            defer {
-                IOServiceClose(conn)
-                IOConnectRelease(conn)
-            }
+        }
 
-            guard IOHIDSetModifierLockState(conn, Int32(kIOHIDCapsLockState), false) == KERN_SUCCESS else {
-                warning("IOHIDSetModifierLockState 실패: \(conn)")
-                continue
-            }
-
-            debug("IOHIDSetModifierLockState 성공: \(dev)")
-
-            /** HID: Caps Lock LED */
-            guard let elems = IOHIDDeviceCopyMatchingElements(dev, [
-                kIOHIDElementUsagePageKey: kHIDPage_LEDs,     // LED Page (0x08)
-                kIOHIDElementUsageKey: kHIDUsage_LED_CapsLock // Caps Lock (0x02)
-            ] as CFDictionary, 0) as? [IOHIDElement] else {
-                warning("IOHIDDeviceCopyMatchingElements 실패: \(dev)")
-                continue
-            }
-
-            let time = mach_absolute_time()
-            for elem in elems {
-                let val = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, elem, time, enabled ? 1 : 0)
-                guard IOHIDDeviceSetValue(dev, elem, val) == kIOReturnSuccess else {
-                    warning("IOHIDDeviceSetValue 실패: \(elem)")
-                    continue
-                }
-            }
-
+        if wroteLED {
             debug("IOHIDDeviceSetValue 성공: \(dev)")
         }
     }
-    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100), execute: block2)
-    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300), execute: block2)
 
-    state = enabled
+    if wroteLED {
+        hidFailureCount = 0
+    } else {
+        hidFailureCount += 1
+        if hidFailureCount >= 3 {
+            debug("HID manager 재생성")
+            hidManager = nil
+            hidFailureCount = 0
+        }
+    }
 }
 
 func getKeyboardCapsLock() -> Bool {

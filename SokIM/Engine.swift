@@ -130,11 +130,16 @@ extension Engine {
         let isOptionDown = flags.contains(.option)
         let isShiftDown = flags.contains(.shift)
 
-        // Caps Lock: 활성화 상태
-        let isCapsLockOn = flags.contains(.capsLock)
+        // 한/A 키를 길게 눌러 켠 Caps Lock은 내부 상태로 판정한다.
+        let isCapsLockOn = Preferences.rotateShortcuts.contains(.capsLock)
+            ? getKeyboardCapsLock()
+            : flags.contains(.capsLock)
 
         if let usage = keyCodeToUsage[Int(keyCode)],
-           let tuple = usageToTuple(usage, isOptionDown, isShiftDown, isCapsLockOn) {
+           var tuple = usageToTuple(usage, isOptionDown, isShiftDown, isCapsLockOn) {
+            if tuple.char == "₩" && Preferences.graveOverWon {
+                tuple.char = "`"
+            }
             return tuple
         } else {
             return nil

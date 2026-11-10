@@ -50,12 +50,24 @@ class InputMonitor {
     private var inputs: [Input] = []
     private var restartTimer = DispatchWorkItem(block: {})
 
+    var isRunning: Bool { hid != nil }
+
+    func cancelCapsLockHoldTimer() {
+        capsLockTimer.cancel()
+        modifier[.capsLock] = .keyUp
+    }
+
     func start() throws {
         debug()
 
         if hid != nil {
             warning("초기화된 hid가 이미 있음")
             return
+        }
+
+        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+            warning("입력 모니터링 미허용, 시스템 요청")
+            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
 
         let hid = IOHIDManagerCreate(kCFAllocatorDefault, 0)
@@ -119,6 +131,11 @@ class InputMonitor {
 
     func stop() {
         debug()
+        restartTimer.cancel()
+        capsLockTimer.cancel()
+        modifier.removeAll()
+        inputs.removeAll()
+        canCapsLockRotate = true
 
         if let hid {
             IOHIDManagerClose(hid, 0)
@@ -138,6 +155,7 @@ class InputMonitor {
             debug()
 
             stop()
+            appDelegate()?.resetInputState()
             try? start()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1), execute: restartTimer)
@@ -166,6 +184,15 @@ class InputMonitor {
     private var capsLockTimer = DispatchWorkItem(block: {})
 
     private func nextHID(_ value: IOHIDValue, _ device: IOHIDDevice) {
+        guard !(appDelegate()?.isSecureInputEnabledInFrontmostApp() ?? true),
+              isSokIMCurrentInputSource() else {
+            capsLockTimer.cancel()
+            modifier.removeAll()
+            inputs.removeAll()
+            canCapsLockRotate = true
+            return
+        }
+
         let timestamp = IOHIDValueGetTimeStamp(value)
         let type: InputType = IOHIDValueGetIntegerValue(value) != 0 ? .keyDown : .keyUp
         var usage = IOHIDElementGetUsage(IOHIDValueGetElement(value))
@@ -180,6 +207,7 @@ class InputMonitor {
 
         // usage가 modifier인 경우
         if let key = ModifierUsage(rawValue: usage) {
+            let wasKeyDown = modifier[key] == .keyDown
             modifier[key] = type
 
             // 별도 처리: Control, Command, Caps Lock 입력되면 조합 종료
@@ -188,58 +216,64 @@ class InputMonitor {
                 appDelegate()?.commit()
             }
 
-            // 별도 처리: 오른쪽 Command: 한/A 표시만 *우선 처리*, 실제 처리는 State에서
-            if (type, key) == (.keyDown, .rightCommand)
-                && Preferences.rotateShortcuts.contains(.rightCommand) {
-                appDelegate()?.statusBar.rotateEngine()
+            // 별도 처리: 오른쪽 Command: 한/A 즉시 전환, handle()의 중복 전환은 State에서 건너뜀
+            if (type, key) == (.keyDown, .rightCommand) && !wasKeyDown
+                && Preferences.rotateShortcuts.contains(.rightCommand)
+                && isSokIMCurrentInputSource() {
+                appDelegate()?.rotateFromShortcut()
             }
 
-            // 별도 처리: 오른쪽 Option: 조합 종료 후 한/A 표시만 *우선 처리*, 실제 처리는 State에서
-            if (type, key) == (.keyDown, .rightOption)
-                && Preferences.rotateShortcuts.contains(.rightOption) {
+            // 별도 처리: 오른쪽 Option: 조합 종료 후 한/A 즉시 전환
+            if (type, key) == (.keyDown, .rightOption) && !wasKeyDown
+                && Preferences.rotateShortcuts.contains(.rightOption)
+                && isSokIMCurrentInputSource() {
                 appDelegate()?.commit()
-                appDelegate()?.statusBar.rotateEngine()
+                appDelegate()?.rotateFromShortcut()
             }
 
-            // 별도 처리: Caps Lock: 한/A 상태 및 LED *우선 처리*, 실제 처리는 State에서
-            if (type, key) == (.keyDown, .capsLock) {
+            // 별도 처리: Caps Lock: 한/A 즉시 전환. LED 쓰기는 백그라운드에서 처리
+            if (type, key) == (.keyDown, .capsLock) && !wasKeyDown {
                 if Preferences.rotateShortcuts.contains(.capsLock) {
-                    /* 한/A 전환이 Caps Lock인 경우 800ms 이상 누르고 있으면 활성화 */
-                    let enabled = getKeyboardCapsLock()
+                    let delegate = appDelegate()
+                    if delegate != nil {
+                        markCapsLockHandledByHID()
+                    }
 
-                    // Caps Lock 활성 -> 비활성: 한/A 전환 1회 억제
+                    // 800ms 이상 누르면 Caps Lock을 활성화한다.
+                    let enabled = getKeyboardCapsLock()
                     if enabled {
                         canCapsLockRotate = false
                     }
 
-                    // Caps Lock 비활성화 및 타이머 초기화
                     setKeyboardCapsLock(enabled: false)
                     capsLockTimer.cancel()
                     capsLockTimer = DispatchWorkItem { [self] in
-                        debug()
-
-                        if modifier[.capsLock] == .keyDown {
-                            // Caps Lock 비활성 -> 활성: 한/A 전환 1회 억제
+                        if modifier[.capsLock] == .keyDown
+                            && isSokIMCurrentInputSource()
+                            && !(appDelegate()?.isSecureInputEnabledInFrontmostApp() ?? true) {
                             canCapsLockRotate = false
-
-                            // Caps Lock 활성화
                             setKeyboardCapsLock(enabled: true)
-                            appDelegate()?.statusBar.setEngine(QwertyEngine.self) // TODO: #24
+                            appDelegate()?.forceEnglishEngine()
                         }
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(800), execute: capsLockTimer)
 
-                    /* 한/A 표시만 *우선 처리* */
+                    // HID keyDown에서 즉시 전환하고 뒤늦은 CGEvent는 중복 처리하지 않는다.
                     if canCapsLockRotate {
-                        appDelegate()?.statusBar.rotateEngine()
+                        notice("Caps Lock HID down → 한/A")
+                        delegate?.rotateFromShortcut()
                     } else {
                         canCapsLockRotate = true
+                        notice("Caps Lock HID down → 전환 생략")
                     }
                 }
                 // 그 외의 경우 일반 반전 처리
                 else {
                     setKeyboardCapsLock(enabled: !getKeyboardCapsLock())
                 }
+            }
+            if (type, key) == (.keyUp, .capsLock) {
+                capsLockTimer.cancel()
             }
         }
         // 그 외 경우 중 keyDown인 경우
@@ -249,22 +283,24 @@ class InputMonitor {
             let isShiftDown = modifier[.leftShift] == .keyDown || modifier[.rightShift] == .keyDown
             let isControlDown = modifier[.leftControl] == .keyDown || modifier[.rightControl] == .keyDown
 
-            // 별도 처리: Command/Shift/Control + Space: 한/A 표시만 *우선 처리*, 실제 처리는 State에서 // TODO: #15
-            if (
-                isCommandDown
-                && usage == SpecialUsage.space.rawValue
-                && Preferences.rotateShortcuts.contains(.commandSpace)
-            ) || (
-                isShiftDown
-                && usage == SpecialUsage.space.rawValue
-                && Preferences.rotateShortcuts.contains(.shiftSpace)
-            ) || (
-                isControlDown
-                && usage == SpecialUsage.space.rawValue
-                && Preferences.rotateShortcuts.contains(.controlSpace)
+            // 별도 처리: Command/Shift/Control + Space: 한/A 즉시 전환 // TODO: #15
+            if isSokIMCurrentInputSource() && (
+                (
+                    isCommandDown
+                    && usage == SpecialUsage.space.rawValue
+                    && Preferences.rotateShortcuts.contains(.commandSpace)
+                ) || (
+                    isShiftDown
+                    && usage == SpecialUsage.space.rawValue
+                    && Preferences.rotateShortcuts.contains(.shiftSpace)
+                ) || (
+                    isControlDown
+                    && usage == SpecialUsage.space.rawValue
+                    && Preferences.rotateShortcuts.contains(.controlSpace)
+                )
             ) {
                 appDelegate()?.commit()
-                appDelegate()?.statusBar.rotateEngine()
+                appDelegate()?.rotateFromShortcut()
             }
         }
 
